@@ -1,0 +1,86 @@
+[
+  {
+    "id": "s1",
+    "role": "system",
+    "content": "You are an engineering assistant. Preserve protocol correctness and report uncertainty.",
+    "content_type": "text"
+  },
+  {
+    "id": "u-goal",
+    "role": "user",
+    "content": "实现上下文压缩中间件，目标是让长任务在接近模型限制时仍能继续。",
+    "content_type": "text",
+    "protected": true,
+    "tags": ["goal"]
+  },
+  {
+    "id": "u-constraint",
+    "role": "user",
+    "content": "约束：使用 Go；不调用真实外部 LLM；不能修改调用方输入；必须保持 Tool Call 和 Tool Result 关系。",
+    "content_type": "text",
+    "protected": true,
+    "tags": ["constraint"]
+  },
+  {
+    "id": "a-search",
+    "role": "assistant",
+    "content": "先检查现有实现和测试。",
+    "tool_calls": [
+      {"id": "call-search", "name": "search_files", "arguments": "{\"pattern\":\"context\"}"}
+    ]
+  },
+  {
+    "id": "r-search",
+    "role": "tool",
+    "content": "search result: "
+  ,
+    "tool_call_id": "call-search",
+    "tool_name": "search_files",
+    "content_type": "text"
+  },
+  {
+    "id": "a-search-followup",
+    "role": "assistant",
+    "content": "发现方案包含多个候选压缩阶段。",
+    "content_type": "text"
+  },
+  {
+    "id": "a-failure",
+    "role": "assistant",
+    "content": "尝试使用固定头尾裁剪结构化结果。",
+    "tool_calls": [
+      {"id": "call-read", "name": "read_file", "arguments": "{\"path\":\"result.json\"}"}
+    ]
+  },
+  {
+    "id": "r-failure",
+    "role": "tool",
+    "content": "{\"error\":\"truncated JSON became invalid\",\"cause\":\"head-tail fallback split a structured result\"}",
+    "tool_call_id": "call-read",
+    "tool_name": "read_file",
+    "content_type": "json",
+    "tags": ["failure"]
+  },
+  {
+    "id": "a-decision",
+    "role": "assistant",
+    "content": "关键决策：结构化结果使用占位内容，旧 Tool Result 优先清理；整轮摘要时同时移除调用和结果。",
+    "content_type": "text",
+    "protected": true,
+    "tags": ["decision"]
+  },
+  {
+    "id": "u-pending",
+    "role": "user",
+    "content": "待办：补充长会话 fixture，并验证压缩后仍保留目标、约束、失败原因和关键决策。",
+    "content_type": "text",
+    "protected": true,
+    "tags": ["pending"]
+  },
+  {
+    "id": "u-latest",
+    "role": "user",
+    "content": "继续完成实现，并给出可以 review 的 commit。",
+    "content_type": "text"
+  }
+]
