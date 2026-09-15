@@ -242,6 +242,96 @@ func recentToolRound() []Message {
 	}
 }
 
+func TestCompressReusesPreviousSummary(t *testing.T) {
+	first := NewMiddleware(nil, FakeSummarizer{Content: longSessionSummary}).Compress(
+		context.Background(), Request{Messages: loadLongSession(t), ContextLimit: 900},
+	)
+	if first.Status != Degraded {
+		t.Fatalf("initial compression failed: %#v", first)
+	}
+	oldSummary := syntheticMessage(first.Messages)
+	for _, stage := range []string{"clear_tool_result", "summarize", "fallback"} {
+		t.Run(stage, func(t *testing.T) {
+			messages := CloneMessages(first.Messages)
+			budget := 780
+			fake := FakeSummarizer{Content: "旧日志已核查，结论另存。"}
+			if stage == "clear_tool_result" {
+				messages = append(messages,
+					Message{ID: "u-next", Role: RoleUser, Content: "检查下一段离线日志。"},
+					Message{ID: "a-next", Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "c-next", Name: "read_logs", Arguments: `{"path":"next.log"}`}}},
+					Message{ID: "r-next", Role: RoleTool, ToolCallID: "c-next", ToolName: "read_logs", Content: strings.Repeat("ordinary access log line\n", 100)},
+					Message{ID: "a-next-followup", Role: RoleAssistant, Content: "已检查这段日志，没有新增关键事实。"},
+					Message{ID: "u-final", Role: RoleUser, Content: "继续保留已有结论。"},
+				)
+				messages = append(messages, recentToolRound()...)
+				budget = 1100
+			}
+			if stage == "fallback" {
+				fake.Mode = FakeSummaryError
+			}
+			original := CloneMessages(messages)
+			spy := &demoSummarizer{fake: fake}
+			result := NewMiddleware(nil, spy).Compress(context.Background(), Request{Messages: messages, ContextLimit: budget})
+			if result.Status != Degraded || result.AfterTokens > budget || result.FailureReason != "" {
+				t.Fatalf("previous output could not be reused: %#v", result)
+			}
+			if !reflect.DeepEqual(messages, original) {
+				t.Fatal("Compress mutated its input")
+			}
+			for _, evidence := range continuationEvidence {
+				if !reflect.DeepEqual(messageByID(result.Messages, evidence.id), messageByID(original, evidence.id)) {
+					t.Fatalf("protected task information changed: %s", evidence.id)
+				}
+			}
+			if stage == "clear_tool_result" {
+				if spy.calls != 0 || !hasActionType(result.Actions, stage) || !reflect.DeepEqual(messageByID(result.Messages, oldSummary.ID), oldSummary) {
+					t.Fatal("tool clearing must preserve the existing summary, including its historical sources")
+				}
+			} else if stage == "summarize" {
+				summary := syntheticMessage(result.Messages)
+				if spy.calls != 1 || !hasActionType(result.Actions, stage) || messageByID(result.Messages, oldSummary.ID).ID != "" || !reflect.DeepEqual(summary.SourceIDs, []string{oldSummary.ID}) || summary.Role != RoleAssistant {
+					t.Fatalf("new summary must reference the immediate input summary: %#v", summary)
+				}
+			} else {
+				summary := messageByID(result.Messages, oldSummary.ID)
+				if spy.calls != 1 || !hasActionType(result.Actions, "truncate") || !hasDiagnosticCode(result.Diagnostics, "summarizer_error") || summary.Content == oldSummary.Content || !reflect.DeepEqual(summary.SourceIDs, oldSummary.SourceIDs) || summary.Role != RoleAssistant {
+					t.Fatalf("fallback must retain the existing summary's role and sources: %#v", summary)
+				}
+			}
+		})
+	}
+}
+
+type testTokenCounter func([]Message) int
+
+func (f testTokenCounter) CountMessages(messages []Message) int { return f(messages) }
+
+func TestCompressValidatesAgainstUnmodifiedInput(t *testing.T) {
+	messages := []Message{
+		{ID: "system", Role: RoleSystem, Content: "original system"},
+		{ID: "old", Role: RoleUser, Content: strings.Repeat("old history ", 100)},
+		{ID: "current", Role: RoleUser, Content: "continue"},
+	}
+	original := CloneMessages(messages)
+	// Deliberately corrupt a working message through an injected dependency.
+	// The final validation must compare it to the untouched caller input.
+	counter := testTokenCounter(func(working []Message) int {
+		for i := range working {
+			if working[i].Role == RoleSystem {
+				working[i].Content = "corrupted system"
+			}
+		}
+		return (RuneBudgetCounter{}).CountMessages(working)
+	})
+	result := NewMiddleware(counter, nil).Compress(context.Background(), Request{Messages: messages, ContextLimit: 100})
+	if !reflect.DeepEqual(messages, original) {
+		t.Fatal("caller input changed")
+	}
+	if result.Status != CannotFit || result.AfterTokens > 100 || !strings.Contains(result.FailureReason, "System/Developer") {
+		t.Fatalf("final validation missed a changed System message: %#v", result)
+	}
+}
+
 func assertValidOutput(t *testing.T, result Result, original []Message, budget int) {
 	t.Helper()
 	if result.AfterTokens > budget {

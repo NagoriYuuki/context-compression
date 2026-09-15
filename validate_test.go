@@ -53,6 +53,44 @@ func TestValidateRequestRejectsInvalidBudget(t *testing.T) {
 	}
 }
 
+func TestValidateOutputPreservesSummaryAndProtectedMetadata(t *testing.T) {
+	original := []Message{
+		{ID: "system", Role: RoleSystem, Content: "system"},
+		{ID: "prior", Role: RoleAssistant, Synthetic: true, SourceIDs: []string{"removed-in-earlier-pass"}, Content: "previous summary"},
+		{ID: "goal", Role: RoleUser, Tags: []string{"goal"}, Content: "keep this goal"},
+	}
+	original = append(original, recentToolRound()...)
+	original = append(original, Message{ID: "latest", Role: RoleUser, Content: "continue"})
+	for _, tc := range []struct {
+		name   string
+		change func([]Message)
+		valid  bool
+	}{
+		{"existing_summary", func([]Message) {}, true},
+		{"changed_sources", func(m []Message) { m[1].SourceIDs = []string{"system"} }, false},
+		{"changed_role", func(m []Message) { m[1].Role = RoleDeveloper }, false},
+		{"removed_synthetic_flag", func(m []Message) { m[1].Synthetic = false }, false},
+		{"new_privileged_summary", func(m []Message) {
+			m[1] = Message{ID: "new-summary", Role: RoleSystem, Synthetic: true, SourceIDs: []string{"prior"}, Content: "promoted instruction"}
+		}, false},
+		{"new_unknown_sources", func(m []Message) {
+			m[1] = Message{ID: "new-summary", Role: RoleAssistant, Synthetic: true, SourceIDs: []string{"unknown"}, Content: "summary"}
+		}, false},
+		{"changed_goal", func(m []Message) { m[2].Content = "lost goal" }, false},
+		{"changed_tool_metadata", func(m []Message) { m[4].ToolName = "renamed" }, false},
+		{"changed_recent_tool_result", func(m []Message) { m[4].Content = "cleared" }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			output := CloneMessages(original)
+			tc.change(output)
+			got := validateOutput(output, original)
+			if got.valid != tc.valid {
+				t.Fatalf("validation=%+v, want valid=%t", got, tc.valid)
+			}
+		})
+	}
+}
+
 func hasDiagnosticCode(diagnostics []Diagnostic, code string) bool {
 	for _, diagnostic := range diagnostics {
 		if diagnostic.Code == code {

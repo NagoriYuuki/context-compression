@@ -80,7 +80,9 @@ func (m *Middleware) Compress(ctx context.Context, request Request) Result {
 
 	output := RebuildMessages(units)
 	after := counter.CountMessages(output)
-	validation := validateOutput(output, copied)
+	// Units share the working copy's storage. Only the untouched caller input
+	// can serve as the before-compression reference for final validation.
+	validation := validateOutput(output, request.Messages)
 	status := Degraded
 	failureReason := ""
 	if !validation.valid || after > budget {
@@ -550,9 +552,30 @@ func validateOutput(output, original []Message) outputValidation {
 		}
 		seenOutputIDs[message.ID] = true
 
+		previous, existed := originalByID[message.ID]
+		if existed {
+			if message.Role != previous.Role || message.Synthetic != previous.Synthetic {
+				return outputValidation{reason: fmt.Sprintf("message %q changed its role or synthetic flag", message.ID)}
+			}
+			if message.Role == RoleTool && (message.ToolCallID != previous.ToolCallID || message.ToolName != previous.ToolName) {
+				return outputValidation{reason: fmt.Sprintf("Tool Result %q changed its call metadata", message.ID)}
+			}
+		}
 		if message.Synthetic {
+			if message.Role != RoleAssistant || len(message.ToolCalls) != 0 {
+				return outputValidation{reason: fmt.Sprintf("synthetic message %q must be an assistant summary without ToolCalls", message.ID)}
+			}
 			if len(message.SourceIDs) == 0 {
 				return outputValidation{reason: fmt.Sprintf("synthetic message %q has no sources", message.ID)}
+			}
+			if existed {
+				// Its sources were removed in an earlier pass. Keep that provenance
+				// intact and anchor the existing summary at its current input position.
+				if !reflect.DeepEqual(message.SourceIDs, previous.SourceIDs) {
+					return outputValidation{reason: fmt.Sprintf("existing summary %q changed its sources", message.ID)}
+				}
+				positions = append(positions, originalPosition[message.ID])
+				continue
 			}
 			minPosition := len(original)
 			for _, sourceID := range message.SourceIDs {
@@ -581,6 +604,9 @@ func validateOutput(output, original []Message) outputValidation {
 	}
 
 	for _, message := range original {
+		if isProtectedMessage(message) && !sameOutputMessage(output, message) {
+			return outputValidation{reason: fmt.Sprintf("protected message %q was changed or removed", message.ID)}
+		}
 		if message.Role != RoleSystem && message.Role != RoleDeveloper {
 			continue
 		}
@@ -614,13 +640,15 @@ func validateOutput(output, original []Message) outputValidation {
 		}
 	}
 
-	for _, unit := range GroupMessages(original) {
-		if unit.Status != UnitIncomplete {
+	originalUnits := GroupMessages(original)
+	latestToolRound := latestCompletedToolRoundID(originalUnits)
+	for _, unit := range originalUnits {
+		if unit.Status != UnitIncomplete && unit.ID != latestToolRound {
 			continue
 		}
 		for _, message := range unit.Messages {
 			if !sameOutputMessage(output, message) {
-				return outputValidation{reason: fmt.Sprintf("incomplete ToolRound message %q was changed or removed", message.ID)}
+				return outputValidation{reason: fmt.Sprintf("protected ToolRound message %q was changed or removed", message.ID)}
 			}
 		}
 	}

@@ -37,6 +37,8 @@ type Message struct {
 	Tags      []string `json:"tags,omitempty"`
 
 	// Synthetic and SourceIDs identify middleware-generated summary messages.
+	// Sources are the immediate inputs of the pass that created the summary;
+	// an existing summary keeps its provenance when used in a later pass.
 	Synthetic bool     `json:"synthetic,omitempty"`
 	SourceIDs []string `json:"source_ids,omitempty"`
 }
