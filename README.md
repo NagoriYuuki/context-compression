@@ -7,10 +7,18 @@
 使用 Go 1.27.1（与 `go.mod` 一致），在项目目录执行：
 
 ```bash
+make verify   # 构建、vet、全量测试、竞态检查
+make demo     # 打印五个场景的压缩前后全文
+```
+
+`make help` 列出全部目标。不使用 make 时，等价命令为：
+
+```bash
 go build ./...
+go vet ./...
 go test -count=1 ./...
 go test -race ./...
-go vet ./...
+go test -count=1 -run '^TestCompressionDemo$' -v
 ```
 
 项目不调用真实 LLM。默认 `RuneBudgetCounter` 只用于可复现的离线演示；实际接入时应注入目标模型对应的 TokenCounter。
@@ -37,25 +45,24 @@ System/Developer、最新 User、未完成 ToolRound 和最近一次已完成 To
 
 正文按真实顺序展开，没有预览截断，也不重复列出 Actions、诊断和检查表。本例输入预算为 900，估算 Token 从 3924 降到 814。摘要由离线 Fake 提供。
 
-重新运行并在终端查看：
+重新运行并在终端查看全部五个场景：
+
+```bash
+make demo
+```
+
+五个场景分别是 `fit`、`clear_tool_result`、`summary`、`fallback` 和 `cannot_fit`，对应不压缩、工具结果清理、历史摘要、摘要失败降级和必要内容超预算。每个场景都带断言，实际走到的 Action 序列与这里的描述不一致时测试会失败。只看其中一个场景时追加子测试名：
 
 ```bash
 go test -count=1 -run '^TestCompressionDemo$/^summary$' -v
 ```
 
-更新这份文档（仅在场景检查通过后写入）：
+需要完整消息元数据、Actions 和诊断时，或需要在场景检查通过后重新生成 `DEMO.md` 时：
 
 ```bash
-UPDATE_DEMO=1 go test -count=1 -run '^TestCompressionDemo$/^summary$'
+make demo-full
+make demo-update
 ```
-
-需要查看完整消息元数据、Actions 和诊断时，再开启详细输出：
-
-```bash
-COMPRESSION_DEMO_FULL=1 go test -count=1 -run '^TestCompressionDemo$/^summary$' -v
-```
-
-其余演示仍保留：将 `summary` 换成 `fit`、`clear_tool_result`、`fallback` 或 `cannot_fit`，即可分别查看不压缩、工具结果清理、摘要失败降级和必要内容超预算时的完整前后文。
 
 ## 验证说明
 
