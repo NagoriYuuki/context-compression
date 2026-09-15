@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCompressClearsOldToolResultBeforeSummarizing(t *testing.T) {
@@ -329,6 +330,70 @@ func TestCompressValidatesAgainstUnmodifiedInput(t *testing.T) {
 	}
 	if result.Status != CannotFit || result.AfterTokens > 100 || !strings.Contains(result.FailureReason, "System/Developer") {
 		t.Fatalf("final validation missed a changed System message: %#v", result)
+	}
+}
+
+func TestCompressSummaryFailureModesConverge(t *testing.T) {
+	for _, tc := range []struct {
+		name, diagnostic string
+		mode             FakeSummaryMode
+		acceptedSummary  bool
+	}{
+		{"error", "summarizer_error", FakeSummaryError, false},
+		{"empty", "empty_summary", FakeSummaryEmpty, false},
+		{"bad_source", "invalid_summary_sources", FakeSummaryBadSource, false},
+		{"larger_than_input", "summary_not_smaller", FakeSummaryLarge, false},
+		{"deadline", "summarizer_canceled", FakeSummaryWait, false},
+		{"canceled", "summarizer_canceled", FakeSummaryWait, false},
+		{"smaller_but_over_budget", "fallback_applied", FakeSummarySuccess, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			if tc.name == "deadline" {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
+			}
+			defer cancel()
+			if tc.name == "canceled" {
+				cancel()
+			}
+			fake := FakeSummarizer{Mode: tc.mode, Content: "历史已处理。"}
+			if tc.name == "larger_than_input" {
+				fake.Content = strings.Repeat("oversized summary ", 500)
+			}
+			if tc.acceptedSummary {
+				fake.Content = strings.Repeat("已完成历史步骤，等待下一步。", 20)
+			}
+			spy := &demoSummarizer{fake: fake}
+			messages := []Message{
+				{ID: "system", Role: RoleSystem, Content: "不能修改生产数据。"},
+				{ID: "history", Role: RoleUser, Content: strings.Repeat("old history ", 250)},
+				{ID: "latest", Role: RoleUser, Content: "继续当前任务。"},
+			}
+			original := CloneMessages(messages)
+			request := Request{Messages: messages, ContextLimit: 380, OutputReserve: 200, SafetyMargin: 100}
+			result := NewMiddleware(nil, spy).Compress(ctx, request)
+			if result.Status != Degraded || result.AfterTokens > 80 || result.FailureReason != "" {
+				t.Fatalf("fallback did not fit: status=%s tokens=%d reason=%q", result.Status, result.AfterTokens, result.FailureReason)
+			}
+			if spy.calls != 1 || !hasDiagnosticCode(result.Diagnostics, tc.diagnostic) || !hasDiagnosticCode(result.Diagnostics, "fallback_applied") || !hasActionType(result.Actions, "truncate") {
+				t.Fatalf("expected one summary attempt then fallback: calls=%d actions=%v diagnostics=%v", spy.calls, result.Actions, result.Diagnostics)
+			}
+			if hasActionType(result.Actions, "summarize") != tc.acceptedSummary {
+				t.Fatalf("unexpected summary acceptance: %#v", result.Actions)
+			}
+			if tc.acceptedSummary {
+				summary := syntheticMessage(result.Messages)
+				if summary.Role != RoleAssistant || !reflect.DeepEqual(summary.SourceIDs, []string{"history"}) {
+					t.Fatalf("fallback changed summary role or provenance: %#v", summary)
+				}
+			} else if countSyntheticMessages(result.Messages) != 0 {
+				t.Fatal("rejected provider output must not become a summary")
+			}
+			if !reflect.DeepEqual(messages, original) || !reflect.DeepEqual(messageByID(result.Messages, "system"), original[0]) || !reflect.DeepEqual(messageByID(result.Messages, "latest"), original[2]) {
+				t.Fatal("fallback modified caller input or protected context")
+			}
+		})
 	}
 }
 

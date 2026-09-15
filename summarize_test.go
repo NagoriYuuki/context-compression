@@ -42,6 +42,12 @@ func TestFakeSummarizerFailureModes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Summarize() error = %v", err)
 			}
+			if test.mode == FakeSummaryEmpty {
+				if summary.Content != "" || len(summary.SourceIDs) != 0 {
+					t.Fatalf("expected an empty summary, got %#v", summary)
+				}
+				return
+			}
 			if !strings.Contains(summary.Content+strings.Join(summary.SourceIDs, ","), test.want) {
 				t.Fatalf("summary = %#v, missing %q", summary, test.want)
 			}
