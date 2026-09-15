@@ -26,63 +26,42 @@ go vet ./...
 
 System/Developer、最新 User 和未完成 ToolRound 不参与语义摘要或 fallback；保留的 Tool 调用元数据保持原文，整轮摘要时调用和结果一起替换。输入会先深拷贝，无法安全满足预算时返回 `CannotFit`；输入协议非法时返回 `InvalidInput`。
 
-## 验证
+## 直观看压缩前后全文
 
-### 直接看功能演示
+直接打开 [DEMO.md](DEMO.md)。这是一份实际运行生成的对照文档，只包含简短结果和两个部分：
 
-```bash
-go test -count=1 -run '^TestCompressionDemo$' -v
-```
+- **压缩前：完整原文**，15 条消息，包括全部日志、工具调用参数和工具结果。
+- **压缩后：完整内容**，12 条消息，包括实际生成的摘要及保留的所有原文。
 
-`-v` 显示演示报告，`-count=1` 确保本次重新执行。仅看到普通 `go test` 的 `ok` 不会展示压缩过程。
+正文按真实顺序展开，没有预览截断，也不重复列出 Actions、诊断和检查表。本例输入预算为 900，估算 Token 从 3924 降到 814。摘要由离线 Fake 提供。
 
-五个场景共用 `fixtures/long_session.json` 中的订单 API 超时排查任务。样例包含 15 条消息、三轮 Tool 交互、目标、只读约束、权限失败、关键决策、连接池配置证据和待办。日志与工具调用记录均为虚构数据；工具参数中的路径只表示历史记录，运行时不会打开这些文件。
-
-以下是当前 fixture 和默认计数器的实际运行结果，数字均为估算值：
-
-| 子场景 | 输入预算 | 压缩前 → 后 | 摘要器调用次数 | 可观察结果 |
-| --- | ---: | ---: | ---: | --- |
-| `fit` | 4500 | 3924 → 3924 | 0 | `fit`，消息与元数据原样返回 |
-| `clear_tool_result` | 1700 | 3924 → 1612 | 0 | `degraded`，大日志换成占位文本，调用和结果仍成对 |
-| `summary` | 900 | 3924 → 814 | 1 | `degraded`，清理后再用一条有来源的摘要替换旧历史 |
-| `fallback` | 900 | 3924 → 900 | 1 | `degraded`，Fake 报错后截断旧文本，不重试摘要 |
-| `cannot_fit` | 300 | 690 → 690 | 0 | `cannot_fit`，必要内容保持原文，说明仍超预算 |
-
-每个场景额外预留 200 的输出空间和 100 的安全余量；例如 `summary` 的输入预算为 `1200 - 200 - 100 = 900`。`cannot_fit` 使用同一会话去掉四条过程性历史后的 11 条必要消息，保留重要工具结果所需的完整调用关系。
-
-报告依次给出预算和触发原因、实际摘要调用次数、Actions、实际输出顺序、逐消息前后对照、替换文本全文、摘要角色与 `SourceIDs`、工具配对及参数、关键任务信息全文、Diagnostics 和失败原因。
-
-建议先单独看摘要场景：
+重新运行并在终端查看：
 
 ```bash
 go test -count=1 -run '^TestCompressionDemo$/^summary$' -v
 ```
 
-重点检查这三处：
+更新这份文档（仅在场景检查通过后写入）：
 
-1. `clear_tool_result` 后还有 `summarize`，且摘要器实际调用次数为 1。
-2. 新消息 `summary:u-history` 的角色为 `assistant`、`Synthetic=true`，`SourceIDs` 为 `u-history`、`a-logs`、`r-logs`、`a-logs-followup`；旧调用与结果一起被替换，摘要插在原历史位置。
-3. “任务继续性证据”里能读到原文：禁止修改生产数据、查询缺少 SELECT 权限、改查离线日志、连接池上限为 8、下一步核对并发等信息均保留。
+```bash
+UPDATE_DEMO=1 go test -count=1 -run '^TestCompressionDemo$/^summary$'
+```
 
-将命令里的 `summary` 换成表中的其他子场景名即可单独运行。需要逐字段检查完整输入输出时：
+需要查看完整消息元数据、Actions 和诊断时，再开启详细输出：
 
 ```bash
 COMPRESSION_DEMO_FULL=1 go test -count=1 -run '^TestCompressionDemo$/^summary$' -v
 ```
 
-也可以保存一次实际演示输出，供 review 时查看：
+其余演示仍保留：将 `summary` 换成 `fit`、`clear_tool_result`、`fallback` 或 `cannot_fit`，即可分别查看不压缩、工具结果清理、摘要失败降级和必要内容超预算时的完整前后文。
 
-```bash
-go test -count=1 -run '^TestCompressionDemo$' -v > /tmp/context-compression-demo.txt
-```
+## 验证说明
 
-### 演示与自动化验收的关系
+`fixtures/long_session.json` 是虚构的订单 API 超时排查会话，包含目标、约束、三轮工具交互、权限失败、事实、决策和待办。工具参数中的路径仅为历史记录，运行时不会打开对应文件。
 
-`demo_test.go` 负责可读展示，并检查实际到达声明的路径、返回状态、预算、摘要调用次数及来源。演示路径不正确时测试会失败。
+演示默认隐藏检查过程，但仍断言实际路径、预算、摘要调用次数和来源。`fixture_test.go` 独立于中间件的 `validateOutput` 检查关键消息全文、工具配对及参数、顺序、JSON 内容类型和调用方输入不变。
 
-`fixture_test.go` 验证关键消息的完整内容与元数据、Tool Call/Result 配对及参数、消息顺序、摘要来源、JSON 内容类型和调用方输入不变；这些检查不复用中间件自身的 `validateOutput`。其余测试负责预算、消息模型、协议及失败边界等验证。
-
-任务继续性依赖调用方显式提供 `Protected` 或 `goal/constraint/fact/decision/failure/pending` 标签。演示证明本样例所需信息仍可读取；Fake 摘要由人工根据样例编写，不代表自动语义理解、摘要语义等价，或真实 Agent 已继续完成任务。这五个场景是功能讲解入口，不等于穷尽所有验收输入。
+关键任务信息通过调用方显式的 `Protected` 和标签保护。样例证明这些信息在输出中仍然可读取，不代表真实 Agent 已继续完成任务，也不证明任意摘要的语义等价性。
 
 ## 当前限制
 

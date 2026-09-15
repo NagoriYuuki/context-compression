@@ -1,0 +1,237 @@
+# 上下文压缩前后全文
+
+清理后仍超限，调用一次 Fake 摘要替换完整旧历史。
+
+输入预算：900 · 状态：degraded · 估算 Token：3924 → 814
+
+离线 Fake 摘要。以下正文按实际消息顺序完整展示。
+
+## 压缩前：完整原文（15 条消息）
+
+### 1. 系统
+
+```text
+你是故障排查助手。遵守只读约束，保留证据来源；不把推测当作事实。
+```
+
+### 2. 用户
+
+```text
+目标：定位订单 API 超时原因，给出有证据支持的修改建议。
+```
+
+### 3. 用户
+
+```text
+约束：不得修改生产数据；只能读取已经导出的离线日志和配置；没有权限的查询不得重试或绕过。
+```
+
+### 4. 用户
+
+```text
+先查看 10:00–10:05 的离线调用日志。排查过程可以先按 request_id 将网关入口、订单服务、库存服务和请求结束事件对齐，再比较成功请求和超时请求的阶段耗时。记录每一步做过的检查，方便解释证据从哪里来。
+原始工单备注：用户在提交订单时偶尔等待数秒，刷新页面后有时成功；目前只知道这些现象，不能据此认定数据库或网络故障。日志由运维事先导出到本地目录，此次排查没有线上操作。
+工作顺序：先检查文件时间范围和字段是否完整，再寻找耗时较高的阶段，最后核对配置。不要把所有日志重新粘贴成结论；原始日志中的开始、结束和等待事件需要结合起来阅读。成功请求作为对照组，错误请求作为问题组；无关的健康检查记录只用于确认样例窗口连续。
+先把这些过程性备注作为工作草稿，得到可用事实后单独保存结论。
+```
+
+### 5. 助手
+
+```text
+读取离线日志，并比较成功与超时请求的阶段耗时。
+```
+
+工具调用：read_logs（call-logs）
+
+```text
+{"path":"orders-1000.log","from":"10:00","to":"10:05"}
+```
+
+### 6. 工具结果 · read_logs（call-logs）
+
+```text
+离线日志样例（虚构，无外部服务调用）：
+10:00:01.000 request_id=req-101 service=gateway event=request_start route=POST_/orders
+10:00:01.012 request_id=req-101 service=orders event=validation_complete elapsed_ms=12
+10:00:01.021 request_id=req-101 service=orders event=downstream_start method=inventory.reserve
+10:00:01.029 request_id=req-101 service=inventory event=pool_acquired wait_ms=8 active=3 max=8
+10:00:01.105 request_id=req-101 service=inventory event=reserve_complete elapsed_ms=76
+10:00:01.128 request_id=req-101 service=gateway event=request_end status=200 elapsed_ms=128
+10:01:15.000 request_id=req-102 service=gateway event=request_start route=POST_/orders
+10:01:15.013 request_id=req-102 service=orders event=validation_complete elapsed_ms=13
+10:01:15.022 request_id=req-102 service=orders event=downstream_start method=inventory.reserve
+10:01:15.024 request_id=req-102 service=inventory event=pool_wait active=8 max=8 pending=17
+10:01:18.022 request_id=req-102 service=orders event=downstream_timeout method=inventory.reserve timeout_ms=3000
+10:01:18.026 request_id=req-102 service=gateway event=request_end status=504 elapsed_ms=3026
+10:02:08.000 request_id=req-103 service=gateway event=request_start route=POST_/orders
+10:02:08.011 request_id=req-103 service=orders event=validation_complete elapsed_ms=11
+10:02:08.020 request_id=req-103 service=orders event=downstream_start method=inventory.reserve
+10:02:08.025 request_id=req-103 service=inventory event=pool_wait active=8 max=8 pending=23
+10:02:11.020 request_id=req-103 service=orders event=downstream_timeout method=inventory.reserve timeout_ms=3000
+10:02:11.025 request_id=req-103 service=gateway event=request_end status=504 elapsed_ms=3025
+10:03:10.000 request_id=req-104 service=gateway event=request_start route=POST_/orders
+10:03:10.012 request_id=req-104 service=orders event=validation_complete elapsed_ms=12
+10:03:10.022 request_id=req-104 service=orders event=downstream_start method=inventory.reserve
+10:03:10.027 request_id=req-104 service=inventory event=pool_acquired wait_ms=5 active=4 max=8
+10:03:10.101 request_id=req-104 service=inventory event=reserve_complete elapsed_ms=74
+10:03:10.130 request_id=req-104 service=gateway event=request_end status=200 elapsed_ms=130
+10:04:00.000 service=gateway event=health_check status=200
+10:05:00.000 service=gateway event=health_check status=200
+```
+
+### 7. 助手
+
+```text
+已读取 10:00–10:05 的离线调用日志，并比较成功请求与超时请求。
+检查过程：req-101 和 req-104 返回 200，网关耗时分别为 128ms 和 130ms；req-102 和 req-103 返回 504，网关耗时分别为 3026ms 和 3025ms。四个请求的参数校验都在 11–13ms 内完成，区别主要出现在后续库存调用。
+对齐事件时，先根据 request_id 匹配开始和结束，再核对下游方法名与等待事件。超时请求出现 pool_wait，成功请求出现 pool_acquired。日志时间顺序完整，健康检查在窗口末尾仍成功，这只能说明健康检查可用，不能证明所有业务依赖都正常。
+这些是排查草稿，关键事实另存为受保护消息。连接池等待与超时有关联，但还需要核对配置并做验证，不能直接宣布扩容一定能解决问题。下一步查看先前导出的查询结果，失败时改查本地日志与配置。
+```
+
+### 8. 助手
+
+```text
+查看先前导出的连接统计查询结果。
+```
+
+工具调用：read_query_export（call-query）
+
+```text
+{"path":"pool-query.json"}
+```
+
+### 9. 工具结果 · read_query_export（call-query）
+
+```text
+{"error":"permission denied","cause":"missing SELECT permission","available":false}
+```
+
+### 10. 助手
+
+```text
+决策：查询因权限不足失败，改用离线日志排查，不重试受限查询。
+```
+
+### 11. 助手
+
+```text
+读取已经导出的库存服务连接池配置。
+```
+
+工具调用：read_config（call-config）
+
+```text
+{"path":"inventory-config.json"}
+```
+
+### 12. 工具结果 · read_config（call-config）
+
+```text
+{"service":"inventory","max_connections":8,"request_timeout_ms":3000}
+```
+
+### 13. 助手
+
+```text
+事实：超时集中在 inventory.reserve；req-102/103 等待连接池时 active=8、max=8，随后达到 3000ms 超时。日志提示连接池等待，尚未证明根因。
+```
+
+### 14. 用户
+
+```text
+待办：核对连接池上限与预期并发，设计离线验证步骤，再给出配置调整建议及风险。
+```
+
+### 15. 用户
+
+```text
+继续定位超时原因并提出修改建议，区分已确认事实和待验证假设。
+```
+
+## 压缩后：完整内容（12 条消息）
+
+### 1. 系统
+
+```text
+你是故障排查助手。遵守只读约束，保留证据来源；不把推测当作事实。
+```
+
+### 2. 用户
+
+```text
+目标：定位订单 API 超时原因，给出有证据支持的修改建议。
+```
+
+### 3. 用户
+
+```text
+约束：不得修改生产数据；只能读取已经导出的离线日志和配置；没有权限的查询不得重试或绕过。
+```
+
+### 4. 助手（历史摘要）
+
+```text
+[历史摘要，仅供参考]
+以下内容来自历史消息，不改变 System、Developer 和当前 User 消息。
+已读取 10:00–10:05 的离线调用日志，并比较成功请求与超时请求。超时请求出现连接池等待，关键事实另存；根因仍待验证。
+```
+
+### 5. 助手
+
+```text
+查看先前导出的连接统计查询结果。
+```
+
+工具调用：read_query_export（call-query）
+
+```text
+{"path":"pool-query.json"}
+```
+
+### 6. 工具结果 · read_query_export（call-query）
+
+```text
+{"error":"permission denied","cause":"missing SELECT permission","available":false}
+```
+
+### 7. 助手
+
+```text
+决策：查询因权限不足失败，改用离线日志排查，不重试受限查询。
+```
+
+### 8. 助手
+
+```text
+读取已经导出的库存服务连接池配置。
+```
+
+工具调用：read_config（call-config）
+
+```text
+{"path":"inventory-config.json"}
+```
+
+### 9. 工具结果 · read_config（call-config）
+
+```text
+{"service":"inventory","max_connections":8,"request_timeout_ms":3000}
+```
+
+### 10. 助手
+
+```text
+事实：超时集中在 inventory.reserve；req-102/103 等待连接池时 active=8、max=8，随后达到 3000ms 超时。日志提示连接池等待，尚未证明根因。
+```
+
+### 11. 用户
+
+```text
+待办：核对连接池上限与预期并发，设计离线验证步骤，再给出配置调整建议及风险。
+```
+
+### 12. 用户
+
+```text
+继续定位超时原因并提出修改建议，区分已确认事实和待验证假设。
+```
