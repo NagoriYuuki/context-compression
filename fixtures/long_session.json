@@ -2,85 +2,132 @@
   {
     "id": "s1",
     "role": "system",
-    "content": "You are an engineering assistant. Preserve protocol correctness and report uncertainty.",
+    "content": "你是故障排查助手。遵守只读约束，保留证据来源；不把推测当作事实。",
     "content_type": "text"
   },
   {
     "id": "u-goal",
     "role": "user",
-    "content": "实现上下文压缩中间件，目标是让长任务在接近模型限制时仍能继续。",
-    "content_type": "text",
-    "protected": true,
-    "tags": ["goal"]
+    "content": "目标：定位订单 API 超时原因，给出有证据支持的修改建议。",
+    "tags": [
+      "goal"
+    ]
   },
   {
     "id": "u-constraint",
     "role": "user",
-    "content": "约束：使用 Go；不调用真实外部 LLM；不能修改调用方输入；必须保持 Tool Call 和 Tool Result 关系。",
-    "content_type": "text",
-    "protected": true,
-    "tags": ["constraint"]
-  },
-  {
-    "id": "a-search",
-    "role": "assistant",
-    "content": "先检查现有实现和测试。",
-    "tool_calls": [
-      {"id": "call-search", "name": "search_files", "arguments": "{\"pattern\":\"context\"}"}
+    "content": "约束：不得修改生产数据；只能读取已经导出的离线日志和配置；没有权限的查询不得重试或绕过。",
+    "tags": [
+      "constraint"
     ]
   },
   {
-    "id": "r-search",
-    "role": "tool",
-    "content": "search result: "
-  ,
-    "tool_call_id": "call-search",
-    "tool_name": "search_files",
+    "id": "u-history",
+    "role": "user",
+    "content": "先查看 10:00–10:05 的离线调用日志。排查过程可以先按 request_id 将网关入口、订单服务、库存服务和请求结束事件对齐，再比较成功请求和超时请求的阶段耗时。记录每一步做过的检查，方便解释证据从哪里来。\n原始工单备注：用户在提交订单时偶尔等待数秒，刷新页面后有时成功；目前只知道这些现象，不能据此认定数据库或网络故障。日志由运维事先导出到本地目录，此次排查没有线上操作。\n工作顺序：先检查文件时间范围和字段是否完整，再寻找耗时较高的阶段，最后核对配置。不要把所有日志重新粘贴成结论；原始日志中的开始、结束和等待事件需要结合起来阅读。成功请求作为对照组，错误请求作为问题组；无关的健康检查记录只用于确认样例窗口连续。\n先把这些过程性备注作为工作草稿，得到可用事实后单独保存结论。",
     "content_type": "text"
   },
   {
-    "id": "a-search-followup",
+    "id": "a-logs",
     "role": "assistant",
-    "content": "发现方案包含多个候选压缩阶段。",
+    "content": "读取离线日志，并比较成功与超时请求的阶段耗时。",
+    "tool_calls": [
+      {
+        "id": "call-logs",
+        "name": "read_logs",
+        "arguments": "{\"path\":\"orders-1000.log\",\"from\":\"10:00\",\"to\":\"10:05\"}"
+      }
+    ]
+  },
+  {
+    "id": "r-logs",
+    "role": "tool",
+    "tool_call_id": "call-logs",
+    "tool_name": "read_logs",
+    "content_type": "text",
+    "content": "离线日志样例（虚构，无外部服务调用）：\n10:00:01.000 request_id=req-101 service=gateway event=request_start route=POST_/orders\n10:00:01.012 request_id=req-101 service=orders event=validation_complete elapsed_ms=12\n10:00:01.021 request_id=req-101 service=orders event=downstream_start method=inventory.reserve\n10:00:01.029 request_id=req-101 service=inventory event=pool_acquired wait_ms=8 active=3 max=8\n10:00:01.105 request_id=req-101 service=inventory event=reserve_complete elapsed_ms=76\n10:00:01.128 request_id=req-101 service=gateway event=request_end status=200 elapsed_ms=128\n10:01:15.000 request_id=req-102 service=gateway event=request_start route=POST_/orders\n10:01:15.013 request_id=req-102 service=orders event=validation_complete elapsed_ms=13\n10:01:15.022 request_id=req-102 service=orders event=downstream_start method=inventory.reserve\n10:01:15.024 request_id=req-102 service=inventory event=pool_wait active=8 max=8 pending=17\n10:01:18.022 request_id=req-102 service=orders event=downstream_timeout method=inventory.reserve timeout_ms=3000\n10:01:18.026 request_id=req-102 service=gateway event=request_end status=504 elapsed_ms=3026\n10:02:08.000 request_id=req-103 service=gateway event=request_start route=POST_/orders\n10:02:08.011 request_id=req-103 service=orders event=validation_complete elapsed_ms=11\n10:02:08.020 request_id=req-103 service=orders event=downstream_start method=inventory.reserve\n10:02:08.025 request_id=req-103 service=inventory event=pool_wait active=8 max=8 pending=23\n10:02:11.020 request_id=req-103 service=orders event=downstream_timeout method=inventory.reserve timeout_ms=3000\n10:02:11.025 request_id=req-103 service=gateway event=request_end status=504 elapsed_ms=3025\n10:03:10.000 request_id=req-104 service=gateway event=request_start route=POST_/orders\n10:03:10.012 request_id=req-104 service=orders event=validation_complete elapsed_ms=12\n10:03:10.022 request_id=req-104 service=orders event=downstream_start method=inventory.reserve\n10:03:10.027 request_id=req-104 service=inventory event=pool_acquired wait_ms=5 active=4 max=8\n10:03:10.101 request_id=req-104 service=inventory event=reserve_complete elapsed_ms=74\n10:03:10.130 request_id=req-104 service=gateway event=request_end status=200 elapsed_ms=130\n10:04:00.000 service=gateway event=health_check status=200\n10:05:00.000 service=gateway event=health_check status=200"
+  },
+  {
+    "id": "a-logs-followup",
+    "role": "assistant",
+    "content": "已读取 10:00–10:05 的离线调用日志，并比较成功请求与超时请求。\n检查过程：req-101 和 req-104 返回 200，网关耗时分别为 128ms 和 130ms；req-102 和 req-103 返回 504，网关耗时分别为 3026ms 和 3025ms。四个请求的参数校验都在 11–13ms 内完成，区别主要出现在后续库存调用。\n对齐事件时，先根据 request_id 匹配开始和结束，再核对下游方法名与等待事件。超时请求出现 pool_wait，成功请求出现 pool_acquired。日志时间顺序完整，健康检查在窗口末尾仍成功，这只能说明健康检查可用，不能证明所有业务依赖都正常。\n这些是排查草稿，关键事实另存为受保护消息。连接池等待与超时有关联，但还需要核对配置并做验证，不能直接宣布扩容一定能解决问题。下一步查看先前导出的查询结果，失败时改查本地日志与配置。",
     "content_type": "text"
   },
   {
     "id": "a-failure",
     "role": "assistant",
-    "content": "尝试使用固定头尾裁剪结构化结果。",
+    "content": "查看先前导出的连接统计查询结果。",
     "tool_calls": [
-      {"id": "call-read", "name": "read_file", "arguments": "{\"path\":\"result.json\"}"}
+      {
+        "id": "call-query",
+        "name": "read_query_export",
+        "arguments": "{\"path\":\"pool-query.json\"}"
+      }
     ]
   },
   {
     "id": "r-failure",
     "role": "tool",
-    "content": "{\"error\":\"truncated JSON became invalid\",\"cause\":\"head-tail fallback split a structured result\"}",
-    "tool_call_id": "call-read",
-    "tool_name": "read_file",
+    "tool_call_id": "call-query",
+    "tool_name": "read_query_export",
     "content_type": "json",
-    "tags": ["failure"]
+    "content": "{\"error\":\"permission denied\",\"cause\":\"missing SELECT permission\",\"available\":false}",
+    "tags": [
+      "failure"
+    ]
   },
   {
     "id": "a-decision",
     "role": "assistant",
-    "content": "关键决策：结构化结果使用占位内容，旧 Tool Result 优先清理；整轮摘要时同时移除调用和结果。",
-    "content_type": "text",
+    "content": "决策：查询因权限不足失败，改用离线日志排查，不重试受限查询。",
+    "tags": [
+      "decision"
+    ]
+  },
+  {
+    "id": "a-config",
+    "role": "assistant",
+    "content": "读取已经导出的库存服务连接池配置。",
+    "tool_calls": [
+      {
+        "id": "call-config",
+        "name": "read_config",
+        "arguments": "{\"path\":\"inventory-config.json\"}"
+      }
+    ]
+  },
+  {
+    "id": "r-config",
+    "role": "tool",
+    "tool_call_id": "call-config",
+    "tool_name": "read_config",
+    "content_type": "json",
+    "content": "{\"service\":\"inventory\",\"max_connections\":8,\"request_timeout_ms\":3000}",
     "protected": true,
-    "tags": ["decision"]
+    "tags": [
+      "fact"
+    ]
+  },
+  {
+    "id": "a-fact",
+    "role": "assistant",
+    "content": "事实：超时集中在 inventory.reserve；req-102/103 等待连接池时 active=8、max=8，随后达到 3000ms 超时。日志提示连接池等待，尚未证明根因。",
+    "tags": [
+      "fact"
+    ]
   },
   {
     "id": "u-pending",
     "role": "user",
-    "content": "待办：补充长会话 fixture，并验证压缩后仍保留目标、约束、失败原因和关键决策。",
-    "content_type": "text",
-    "protected": true,
-    "tags": ["pending"]
+    "content": "待办：核对连接池上限与预期并发，设计离线验证步骤，再给出配置调整建议及风险。",
+    "tags": [
+      "pending"
+    ]
   },
   {
     "id": "u-latest",
     "role": "user",
-    "content": "继续完成实现，并给出可以 review 的 commit。",
+    "content": "继续定位超时原因并提出修改建议，区分已确认事实和待验证假设。",
     "content_type": "text"
   }
 ]
