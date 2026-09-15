@@ -24,7 +24,9 @@ go vet ./...
 3. 摘要失败、超时、为空、变大，或摘要后仍超预算时，执行确定性的文本截断、结构化占位或低价值日志删除；
 4. 重建消息并校验预算、顺序和 Tool 关系。
 
-System/Developer、最新 User 和未完成 ToolRound 不参与语义摘要或 fallback；保留的 Tool 调用元数据保持原文，整轮摘要时调用和结果一起替换。输入会先深拷贝，无法安全满足预算时返回 `CannotFit`；输入协议非法时返回 `InvalidInput`。
+摘要调用受 `Middleware.SummarizeTimeout` 限制，`NewMiddleware` 默认设为 `DefaultSummarizeTimeout`（30s）。该时限由调用方 Context 派生，因此调用方取消仍然优先生效；设为 0 表示不设内部时限，完全交给调用方。选择 30s 的依据是：摘要是真实模型调用前的同步前置步骤，而它的失败路径是确定性 fallback，等待超过一次典型模型调用的时间，不如尽早降级。交互式场景可以调小，离线批处理可以调大。`Summarizer` 实现必须尊重传入的 Context。
+
+System/Developer、最新 User、未完成 ToolRound 和最近一次已完成 ToolRound 不参与清理、语义摘要或 fallback；最近一次已完成结果被保留，是因为结果已返回不代表模型已经消费它。保留的 Tool 调用元数据保持原文，整轮摘要时调用和结果一起替换。输入会先深拷贝，无法安全满足预算时返回 `CannotFit`；输入协议非法时返回 `InvalidInput`。
 
 ## 直观看压缩前后全文
 
@@ -67,7 +69,9 @@ COMPRESSION_DEMO_FULL=1 go test -count=1 -run '^TestCompressionDemo$/^summary$' 
 
 - 默认 Token 估算不等于供应商真实 Token 数；
 - 不做自然语言任务状态抽取；
-- 最近的已完成 Tool Result 没有独立保护窗口，需要保留的当前工具结果应显式标记 `Protected`；
+- 内部超时只能放弃等待，无法强制中断不尊重 Context 的 `Summarizer` 实现；
+- 摘要只作用于最早一段连续的可压缩历史，不迭代后续片段；
+- 每次修改后重新全量计数，接入高成本 Tokenizer 时需要自行加缓存；
 - 演示覆盖单次压缩，未验证多轮摘要累积的来源传播和信息衰减；
 - 不修改或语义摘要 System/Developer；
 - 不接长期记忆、向量检索和真实摘要服务。

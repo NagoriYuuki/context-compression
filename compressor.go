@@ -2,10 +2,12 @@ package compression
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -16,22 +18,34 @@ const (
 	fallbackRunes         = 256
 )
 
+// DefaultSummarizeTimeout bounds one summarizer call. Summarization is a
+// blocking step before the real model request, and its failure path is a
+// deterministic fallback, so waiting longer than a typical model call is worse
+// than degrading early.
+const DefaultSummarizeTimeout = 30 * time.Second
+
 // Middleware applies the fixed compression strategy from the implementation
 // plan. Counter and Summarizer are both replaceable for model-specific use and
 // deterministic tests.
 type Middleware struct {
 	Counter    TokenCounter
 	Summarizer Summarizer
+
+	// SummarizeTimeout bounds the single summarizer call. It is derived from
+	// the caller's context, so caller cancellation still takes effect earlier.
+	// Zero disables the internal deadline and leaves the bound to the caller.
+	SummarizeTimeout time.Duration
 }
 
 // NewMiddleware creates a middleware with the deterministic counter when no
 // counter is supplied. A nil summarizer is allowed; compression then relies on
-// deterministic fallback behavior.
+// deterministic fallback behavior. The summarizer call is bounded by
+// DefaultSummarizeTimeout; set SummarizeTimeout afterwards to override it.
 func NewMiddleware(counter TokenCounter, summarizer Summarizer) *Middleware {
 	if counter == nil {
 		counter = RuneBudgetCounter{}
 	}
-	return &Middleware{Counter: counter, Summarizer: summarizer}
+	return &Middleware{Counter: counter, Summarizer: summarizer, SummarizeTimeout: DefaultSummarizeTimeout}
 }
 
 // Compress returns a deep-copied, budget-checked message sequence.
@@ -72,7 +86,7 @@ func (m *Middleware) Compress(ctx context.Context, request Request) Result {
 	clearOldToolResults(units, budget, counter, &actions, &diagnostics)
 
 	if countUnits(units, counter) > budget {
-		units = summarizeOldHistory(ctx, units, budget, counter, m.Summarizer, &actions, &diagnostics)
+		units = summarizeOldHistory(ctx, m.SummarizeTimeout, units, budget, counter, m.Summarizer, &actions, &diagnostics)
 	}
 	if countUnits(units, counter) > budget {
 		units = applyFallback(units, budget, counter, &actions, &diagnostics)
@@ -172,7 +186,7 @@ func clearOldToolResults(units []Unit, budget int, counter TokenCounter, actions
 	}
 }
 
-func summarizeOldHistory(ctx context.Context, units []Unit, budget int, counter TokenCounter, summarizer Summarizer, actions *[]Action, diagnostics *[]Diagnostic) []Unit {
+func summarizeOldHistory(ctx context.Context, timeout time.Duration, units []Unit, budget int, counter TokenCounter, summarizer Summarizer, actions *[]Action, diagnostics *[]Diagnostic) []Unit {
 	if summarizer == nil {
 		appendDiagnostic(diagnostics, "warning", "summarizer_unavailable", "no summarizer configured", "", "")
 		return units
@@ -192,12 +206,27 @@ func summarizeOldHistory(ctx context.Context, units []Unit, budget int, counter 
 		maxTokens = 1
 	}
 
+	// Bound the single provider call. The deadline derives from the caller's
+	// context so caller cancellation still wins, and it never leaks past this
+	// call because the fallback below does not retry.
+	summarizeCtx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		summarizeCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
 	// Pass a copy so a provider cannot mutate the middleware's working units.
-	summary, err := summarizer.Summarize(ctx, cloneUnits(units[start:end]), maxTokens)
+	summary, err := summarizer.Summarize(summarizeCtx, cloneUnits(units[start:end]), maxTokens)
 	if err != nil {
+		// Report the caller's own cancellation first; it propagates into the
+		// derived context and is not a middleware-imposed timeout.
 		code := "summarizer_error"
-		if ctx.Err() != nil {
+		switch {
+		case ctx.Err() != nil:
 			code = "summarizer_canceled"
+		case errors.Is(summarizeCtx.Err(), context.DeadlineExceeded):
+			code = "summarizer_timeout"
 		}
 		appendDiagnostic(diagnostics, "warning", code, err.Error(), "", units[start].ID)
 		return units

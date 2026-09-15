@@ -14,6 +14,9 @@ type Summary struct {
 
 // Summarizer compresses a selected, contiguous range of historical units.
 // Middleware validates the returned content and source IDs before accepting it.
+// Implementations must honor ctx: the middleware bounds this call with a
+// deadline derived from the caller's context and treats a returned error as a
+// one-shot failure that falls through to the deterministic fallback.
 type Summarizer interface {
 	Summarize(ctx context.Context, units []Unit, maxTokens int) (Summary, error)
 }

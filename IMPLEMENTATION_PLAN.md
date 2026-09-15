@@ -382,6 +382,8 @@ type Summarizer interface {
 
 `maxTokens` 是摘要目标上限，不是绝对保证；Middleware 仍然必须用 TokenCounter 重新验证。
 
+单次摘要调用由 `Middleware.SummarizeTimeout` 限时，`NewMiddleware` 默认取 `DefaultSummarizeTimeout`（30s）。该 Context 由调用方 Context 派生：调用方取消优先生效，诊断记为 `summarizer_canceled`；中间件自身时限到期记为 `summarizer_timeout`。设为 0 表示不设内部时限。取值依据是摘要位于真实模型调用前的同步路径上，且失败后有确定性 fallback，因此等待时间不应超过一次典型模型调用。`Summarizer` 实现必须尊重传入的 Context；中间件只能放弃等待，无法强制中断。
+
 默认只实现离线 `FakeSummarizer`，支持：
 
 - 返回固定且更短的摘要；
@@ -456,7 +458,7 @@ func (m *Middleware) Compress(ctx context.Context, req Request) Result {
 }
 ```
 
-如果摘要器为空，第二步直接记录 `summarizer_unavailable`，进入 fallback。Context 被取消时不重试，并在诊断中记录取消原因；如果已有结果满足预算则返回 `Degraded`，否则返回 `CannotFit`。
+如果摘要器为空，第二步直接记录 `summarizer_unavailable`，进入 fallback。摘要调用被内部时限包裹；Context 被取消或超时都不重试，并在诊断中区分 `summarizer_canceled` 与 `summarizer_timeout`；如果已有结果满足预算则返回 `Degraded`，否则返回 `CannotFit`。
 
 ## 10. 输出不变量
 
@@ -510,6 +512,7 @@ func (m *Middleware) Compress(ctx context.Context, req Request) Result {
 
 - 摘要成功且变小时被接受；
 - 摘要失败、取消、空结果、变大或来源错误时只执行一次 fallback；
+- 调用方未设置 deadline 时内部时限生效，卡住的摘要器不会阻塞 `Compress`；调用方取消优先于内部时限；
 - 摘要器最多调用一次；
 - fallback 不触碰 System、最新 User、未完成 ToolRound 和 Tool 元数据；
 - JSON Tool Result fallback 不产生依赖其完整性的伪合法结果；

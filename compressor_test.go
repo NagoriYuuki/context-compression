@@ -397,6 +397,81 @@ func TestCompressSummaryFailureModesConverge(t *testing.T) {
 	}
 }
 
+// A stuck provider must not block Compress, even when the caller supplies a
+// context without a deadline. The caller's own cancellation still wins.
+func TestCompressBoundsSummarizerWithInternalTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		timeout    time.Duration
+		callerCtx  func() (context.Context, context.CancelFunc)
+		diagnostic string
+	}{
+		{
+			"internal_timeout_without_caller_deadline",
+			20 * time.Millisecond,
+			func() (context.Context, context.CancelFunc) { return context.Background(), func() {} },
+			"summarizer_timeout",
+		},
+		{
+			"caller_cancellation_wins_over_internal_timeout",
+			time.Hour,
+			func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 20*time.Millisecond)
+			},
+			"summarizer_canceled",
+		},
+		{
+			"disabled_internal_timeout_defers_to_caller",
+			0,
+			func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 20*time.Millisecond)
+			},
+			"summarizer_canceled",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := tc.callerCtx()
+			defer cancel()
+			messages := []Message{
+				{ID: "system", Role: RoleSystem, Content: "不能修改生产数据。"},
+				{ID: "history", Role: RoleUser, Content: strings.Repeat("old history ", 250)},
+				{ID: "latest", Role: RoleUser, Content: "继续当前任务。"},
+			}
+			original := CloneMessages(messages)
+			spy := &demoSummarizer{fake: FakeSummarizer{Mode: FakeSummaryWait}}
+			middleware := NewMiddleware(nil, spy)
+			middleware.SummarizeTimeout = tc.timeout
+
+			start := time.Now()
+			result := middleware.Compress(ctx, Request{Messages: messages, ContextLimit: 380, OutputReserve: 200, SafetyMargin: 100})
+			if elapsed := time.Since(start); elapsed > 5*time.Second {
+				t.Fatalf("Compress blocked on a stuck summarizer for %s", elapsed)
+			}
+
+			if result.Status != Degraded || result.AfterTokens > 80 || result.FailureReason != "" {
+				t.Fatalf("a stuck summarizer must still degrade within budget: %#v", result)
+			}
+			if spy.calls != 1 || !hasDiagnosticCode(result.Diagnostics, tc.diagnostic) || !hasActionType(result.Actions, "truncate") {
+				t.Fatalf("want one bounded attempt then fallback with %s: calls=%d actions=%v diagnostics=%v", tc.diagnostic, spy.calls, result.Actions, result.Diagnostics)
+			}
+			if countSyntheticMessages(result.Messages) != 0 {
+				t.Fatal("an abandoned summary must not reach the output")
+			}
+			if !reflect.DeepEqual(messages, original) ||
+				!reflect.DeepEqual(messageByID(result.Messages, "system"), original[0]) ||
+				!reflect.DeepEqual(messageByID(result.Messages, "latest"), original[2]) {
+				t.Fatal("the timeout path modified caller input or protected context")
+			}
+		})
+	}
+}
+
+func TestNewMiddlewareAppliesDefaultSummarizeTimeout(t *testing.T) {
+	if got := NewMiddleware(nil, nil).SummarizeTimeout; got != DefaultSummarizeTimeout {
+		t.Fatalf("SummarizeTimeout = %s, want %s", got, DefaultSummarizeTimeout)
+	}
+}
+
 func assertValidOutput(t *testing.T, result Result, original []Message, budget int) {
 	t.Helper()
 	if result.AfterTokens > budget {
