@@ -113,10 +113,22 @@ func countUnits(units []Unit, counter TokenCounter) int {
 	return counter.CountMessages(RebuildMessages(units))
 }
 
+// Keep the latest completed interaction, even when an incomplete round follows.
+// A result having arrived does not mean the model has already consumed it.
+func latestCompletedToolRoundID(units []Unit) string {
+	for i := len(units) - 1; i >= 0; i-- {
+		if units[i].Kind == UnitToolRound && units[i].Status == UnitComplete {
+			return units[i].ID
+		}
+	}
+	return ""
+}
+
 func clearOldToolResults(units []Unit, budget int, counter TokenCounter, actions *[]Action, diagnostics *[]Diagnostic) {
+	latestToolRound := latestCompletedToolRoundID(units)
 	for unitIndex := range units {
 		unit := &units[unitIndex]
-		if unit.Kind != UnitToolRound || unit.Status != UnitComplete {
+		if unit.Kind != UnitToolRound || unit.Status != UnitComplete || unit.ID == latestToolRound {
 			continue
 		}
 
@@ -245,6 +257,7 @@ func summarizeOldHistory(ctx context.Context, units []Unit, budget int, counter 
 
 func findSummaryRange(units []Unit) (int, int) {
 	latestUser := -1
+	latestToolRound := latestCompletedToolRoundID(units)
 	for index, unit := range units {
 		if unit.Kind == UnitUser {
 			latestUser = index
@@ -252,12 +265,12 @@ func findSummaryRange(units []Unit) (int, int) {
 	}
 
 	for index := 0; index < len(units); {
-		if !isSummarizableUnit(units[index], index, latestUser) {
+		if !isSummarizableUnit(units[index], index, latestUser, latestToolRound) {
 			index++
 			continue
 		}
 		start := index
-		for index < len(units) && isSummarizableUnit(units[index], index, latestUser) {
+		for index < len(units) && isSummarizableUnit(units[index], index, latestUser, latestToolRound) {
 			index++
 		}
 		return start, index
@@ -265,8 +278,8 @@ func findSummaryRange(units []Unit) (int, int) {
 	return -1, -1
 }
 
-func isSummarizableUnit(unit Unit, index, latestUser int) bool {
-	if index == latestUser || unit.Status == UnitIncomplete {
+func isSummarizableUnit(unit Unit, index, latestUser int, latestToolRound string) bool {
+	if index == latestUser || unit.Status == UnitIncomplete || unit.ID == latestToolRound {
 		return false
 	}
 	if unit.Kind != UnitUser && unit.Kind != UnitAssistant && unit.Kind != UnitToolRound && unit.Kind != UnitSummary {
@@ -299,6 +312,7 @@ func validSummarySources(sourceIDs []string, units []Unit) bool {
 func applyFallback(units []Unit, budget int, counter TokenCounter, actions *[]Action, diagnostics *[]Diagnostic) []Unit {
 	latestUser := -1
 	latestUserID := ""
+	latestToolRound := latestCompletedToolRoundID(units)
 	initialActionCount := len(*actions)
 	for index, unit := range units {
 		if unit.Kind == UnitUser {
@@ -312,7 +326,7 @@ func applyFallback(units []Unit, budget int, counter TokenCounter, actions *[]Ac
 			break
 		}
 		unit := &units[unitIndex]
-		if unitIndex == latestUser || unit.Status == UnitIncomplete || unit.Kind == UnitSystem || !isFallbackEligible(*unit) {
+		if unitIndex == latestUser || unit.ID == latestToolRound || unit.Status == UnitIncomplete || unit.Kind == UnitSystem || !isFallbackEligible(*unit) {
 			continue
 		}
 

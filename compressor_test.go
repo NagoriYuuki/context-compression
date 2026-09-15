@@ -18,6 +18,7 @@ func TestCompressClearsOldToolResultBeforeSummarizing(t *testing.T) {
 		{ID: "r1", Role: RoleTool, ToolCallID: "c1", ToolName: "search", Content: oldResult},
 		{ID: "u2", Role: RoleUser, Content: "show the result"},
 	}
+	messages = append(messages, recentToolRound()...)
 
 	counter := RuneBudgetCounter{}
 	before := counter.CountMessages(messages)
@@ -36,6 +37,11 @@ func TestCompressClearsOldToolResultBeforeSummarizing(t *testing.T) {
 	}
 	if got := messageByID(result.Messages, "u2").Content; got != "show the result" {
 		t.Fatalf("latest user was changed: %q", got)
+	}
+	for _, message := range recentToolRound() {
+		if !reflect.DeepEqual(messageByID(result.Messages, message.ID), message) {
+			t.Fatalf("recent ToolRound changed: %#v", result.Messages)
+		}
 	}
 	assertValidOutput(t, result, messages, budget)
 }
@@ -105,8 +111,9 @@ func TestCompressSummaryRemovesWholeToolRoundWithoutOrphans(t *testing.T) {
 		{ID: "r1", Role: RoleTool, ToolCallID: "c1", ToolName: "search", Content: strings.Repeat("result ", 100)},
 		{ID: "u1", Role: RoleUser, Content: "continue"},
 	}
+	messages = append(messages, recentToolRound()...)
 	counter := RuneBudgetCounter{}
-	budget := counter.CountMessages([]Message{messages[2]}) + 100
+	budget := counter.CountMessages(messages[2:]) + 100
 	result := NewMiddleware(counter, FakeSummarizer{Content: "tool call completed"}).Compress(
 		context.Background(), Request{Messages: messages, ContextLimit: budget},
 	)
@@ -114,9 +121,12 @@ func TestCompressSummaryRemovesWholeToolRoundWithoutOrphans(t *testing.T) {
 	if result.Status != Degraded {
 		t.Fatalf("Status = %q, want degraded; reason=%s diagnostics=%#v", result.Status, result.FailureReason, result.Diagnostics)
 	}
-	for _, message := range result.Messages {
-		if message.Role == RoleTool || len(message.ToolCalls) > 0 {
-			t.Fatalf("tool round was not removed atomically: %#v", result.Messages)
+	if messageByID(result.Messages, "a1").ID != "" || messageByID(result.Messages, "r1").ID != "" {
+		t.Fatalf("old tool round was not removed atomically: %#v", result.Messages)
+	}
+	for _, message := range recentToolRound() {
+		if !reflect.DeepEqual(messageByID(result.Messages, message.ID), message) {
+			t.Fatalf("recent ToolRound changed: %#v", result.Messages)
 		}
 	}
 	assertValidOutput(t, result, messages, budget)
@@ -166,6 +176,37 @@ func TestCompressKeepsLatestUserTaggedLogAfterOmittingOldLog(t *testing.T) {
 	}
 }
 
+func TestCompressPreservesLatestCompletedToolRound(t *testing.T) {
+	for _, tail := range []string{"unread_result", "with_followup", "with_incomplete_round"} {
+		t.Run(tail, func(t *testing.T) {
+			messages := []Message{
+				{ID: "system", Role: RoleSystem, Content: "只读排查。"},
+				{ID: "current", Role: RoleUser, Content: "读取连接池配置后，解释超时原因。"},
+				{ID: "call", Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "c", Name: "read_config", Arguments: `{"path":"pool.conf"}`}}},
+				{ID: "result", Role: RoleTool, ToolCallID: "c", ToolName: "read_config", Content: strings.Repeat("max_connections=8; timeout_ms=3000;\n", 50)},
+			}
+			if tail == "with_followup" {
+				messages = append(messages, Message{ID: "followup", Role: RoleAssistant, Content: "已读取配置，下一步核对并发。"})
+			}
+			if tail == "with_incomplete_round" {
+				messages = append(messages, Message{ID: "pending-call", Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "pending", Name: "read_logs", Arguments: `{}`}}})
+			}
+			original := CloneMessages(messages)
+			spy := &demoSummarizer{fake: FakeSummarizer{Content: "不能替代当前工具结果。"}}
+			result := NewMiddleware(nil, spy).Compress(context.Background(), Request{Messages: messages, ContextLimit: 200})
+			if result.Status != CannotFit || result.AfterTokens <= 200 || result.FailureReason == "" {
+				t.Fatalf("necessary ToolRound should remain over budget: %#v", result)
+			}
+			if !reflect.DeepEqual(result.Messages, original) || !reflect.DeepEqual(messages, original) {
+				t.Fatalf("current ToolRound or input changed: %#v", result.Messages)
+			}
+			if spy.calls != 0 || len(result.Actions) != 0 {
+				t.Fatalf("protected context must not enter clearing, summary or fallback: calls=%d actions=%v", spy.calls, result.Actions)
+			}
+		})
+	}
+}
+
 func TestCompressLabelsJSONReplacementAsText(t *testing.T) {
 	for _, toolResult := range []bool{false, true} {
 		t.Run(fmt.Sprintf("tool_result=%t", toolResult), func(t *testing.T) {
@@ -176,8 +217,13 @@ func TestCompressLabelsJSONReplacementAsText(t *testing.T) {
 				history.Role, history.ToolCallID, history.ToolName = RoleTool, "c1", "read"
 			}
 			messages = append(messages, history, Message{ID: "latest", Role: RoleUser, Content: "continue"})
+			budget := 150
+			if toolResult {
+				messages = append(messages, recentToolRound()...)
+				budget += (RuneBudgetCounter{}).CountMessages(recentToolRound())
+			}
 			before := CloneMessages(messages)
-			result := NewMiddleware(nil, FakeSummarizer{Mode: FakeSummaryError}).Compress(context.Background(), Request{Messages: messages, ContextLimit: 150})
+			result := NewMiddleware(nil, FakeSummarizer{Mode: FakeSummaryError}).Compress(context.Background(), Request{Messages: messages, ContextLimit: budget})
 			got := messageByID(result.Messages, "history")
 			if result.Status != Degraded || got.Content == history.Content || got.ContentType != "text" {
 				t.Fatalf("expected a text replacement that fits: result=%#v history=%#v", result, got)
@@ -186,6 +232,13 @@ func TestCompressLabelsJSONReplacementAsText(t *testing.T) {
 				t.Fatal("Compress changed caller input")
 			}
 		})
+	}
+}
+
+func recentToolRound() []Message {
+	return []Message{
+		{ID: "a-recent", Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "c-recent", Name: "read_recent", Arguments: `{}`}}},
+		{ID: "r-recent", Role: RoleTool, ToolCallID: "c-recent", ToolName: "read_recent", Content: "最近结果，须保留。"},
 	}
 }
 
