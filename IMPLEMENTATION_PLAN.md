@@ -304,7 +304,7 @@ Tool Result 可以在同一轮内按任意顺序返回，但必须各自匹配�
 
 ```text
 [工具结果已清理]
-原始结果已被模型处理；保留 Tool Call 关系和来源 ID。
+为节省上下文预算省略原文；保留 Tool Call 关系和来源 ID。
 ```
 
 保留：
@@ -316,7 +316,7 @@ Tool Result 可以在同一轮内按任意顺序返回，但必须各自匹配�
 - Tool Call 的参数；
 - 原始 Message ID。
 
-只修改 Tool Result 的 Content，不改变消息数量和协议关系。优先处理最老、体积最大的结果。最近 Tool Result 也可以被清理，只要它属于已完成 ToolRound；未完成 ToolRound 不处理。
+修改 Tool Result 的 Content，并将占位内容的 ContentType 标记为 text，不改变消息数量和协议关系。占位说明不推断模型是否已消费原结果。优先处理最老、体积最大的结果。最近 Tool Result 也可以被清理，只要它属于已完成 ToolRound；未完成 ToolRound 不处理。
 
 这一步不调用摘要器，保证摘要服务不可用时仍能处理常见的大型工具输出。
 
@@ -354,7 +354,7 @@ Fallback 只处理旧的可压缩 Unit：
 
 - 旧 Tool Result：使用第一步的固定占位内容；
 - 普通旧文本消息：保留固定长度的头尾，并加入省略标记；
-- `ContentType=json` 或无法安全截断的结构化内容：使用固定占位内容，避免输出明显非法的伪 JSON；
+- `ContentType=json`：使用固定占位内容并改标为 `text`，避免把占位文本标成 JSON；
 - 仍然超限时，可以删除显式标记为 `log` 且未受保护的旧普通 Unit，并在 Action 中记录 `omit` 和来源 ID；ToolRound 不通过这条规则删除。
 
 Fallback 不处理：

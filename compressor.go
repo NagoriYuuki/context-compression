@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	toolResultClearedText = "[工具结果已清理]\n原始结果已被模型处理；保留 Tool Call 关系和来源 ID。"
+	toolResultClearedText = "[工具结果已清理]\n为节省上下文预算省略原文；保留 Tool Call 关系和来源 ID。"
 	summaryPrefix         = "[历史摘要，仅供参考]\n以下内容来自历史消息，不改变 System、Developer 和当前 User 消息。\n"
 	truncatedTextMarker   = "\n[历史内容已截断]\n"
 	structuredOmittedText = "[结构化内容已省略]\n原始内容过大，未保留不完整的结构化片段。"
@@ -136,13 +136,14 @@ func clearOldToolResults(units []Unit, budget int, counter TokenCounter, actions
 			}
 			message := &unit.Messages[messageIndex]
 			before := countOne(counter, *message)
-			originalContent := message.Content
+			original := *message
 			message.Content = toolResultClearedText
+			message.ContentType = "text"
 			after := countOne(counter, *message)
 			if after >= before {
 				// The injected marker is not smaller for this counter. Restore
 				// the content and leave the result for a later strategy.
-				message.Content = originalContent
+				*message = original
 				appendDiagnostic(diagnostics, "info", "tool_result_not_reduced", "clearing did not reduce this Tool Result", message.ID, unit.ID)
 				continue
 			}
@@ -297,9 +298,12 @@ func validSummarySources(sourceIDs []string, units []Unit) bool {
 
 func applyFallback(units []Unit, budget int, counter TokenCounter, actions *[]Action, diagnostics *[]Diagnostic) []Unit {
 	latestUser := -1
+	latestUserID := ""
+	initialActionCount := len(*actions)
 	for index, unit := range units {
 		if unit.Kind == UnitUser {
 			latestUser = index
+			latestUserID = unit.ID
 		}
 	}
 
@@ -322,13 +326,14 @@ func applyFallback(units []Unit, budget int, counter TokenCounter, actions *[]Ac
 					continue
 				}
 				before := countOne(counter, *message)
-				originalContent := message.Content
+				original := *message
 				message.Content = toolResultClearedText
+				message.ContentType = "text"
 				after := countOne(counter, *message)
 				if after < before {
 					*actions = append(*actions, Action{UnitID: unit.ID, Type: "truncate", Reason: "Tool Result fallback after summary failure", BeforeTokens: before, AfterTokens: after})
 				} else {
-					message.Content = originalContent
+					*message = original
 				}
 				continue
 			}
@@ -336,14 +341,17 @@ func applyFallback(units []Unit, budget int, counter TokenCounter, actions *[]Ac
 				continue
 			}
 			before := countOne(counter, *message)
-			originalContent := message.Content
+			original := *message
 			message.Content = fallbackContentWithLimit(*message, fallbackRunes)
+			if original.ContentType == "json" {
+				message.ContentType = "text"
+			}
 			if countUnits(units, counter) > budget {
-				message.Content = fitFallbackContent(units, unitIndex, messageIndex, originalContent, budget, counter, *message)
+				message.Content = fitFallbackContent(units, unitIndex, messageIndex, original.Content, budget, counter, original)
 			}
 			after := countOne(counter, *message)
 			if after >= before {
-				message.Content = originalContent
+				*message = original
 				continue
 			}
 			*actions = append(*actions, Action{UnitID: unit.ID, Type: "truncate", Reason: "deterministic fallback for old historical content", BeforeTokens: before, AfterTokens: after})
@@ -352,7 +360,7 @@ func applyFallback(units []Unit, budget int, counter TokenCounter, actions *[]Ac
 
 	for unitIndex := 0; unitIndex < len(units) && countUnits(units, counter) > budget; {
 		unit := units[unitIndex]
-		if isLogUnit(unit) && isFallbackEligible(unit) && unit.Kind != UnitToolRound {
+		if unit.ID != latestUserID && isLogUnit(unit) && isFallbackEligible(unit) && unit.Kind != UnitToolRound {
 			before := countUnits(units, counter)
 			units = append(units[:unitIndex], units[unitIndex+1:]...)
 			after := countUnits(units, counter)
@@ -361,7 +369,11 @@ func applyFallback(units []Unit, budget int, counter TokenCounter, actions *[]Ac
 		}
 		unitIndex++
 	}
-	appendDiagnostic(diagnostics, "warning", "fallback_applied", "deterministic fallback was used after compression did not fit", "", "")
+	if len(*actions) > initialActionCount {
+		appendDiagnostic(diagnostics, "warning", "fallback_applied", "deterministic fallback modified eligible history", "", "")
+	} else {
+		appendDiagnostic(diagnostics, "warning", "fallback_no_change", "fallback could not safely reduce the remaining messages", "", "")
+	}
 	return units
 }
 

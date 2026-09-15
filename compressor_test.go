@@ -3,6 +3,8 @@ package compression
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -135,6 +137,55 @@ func TestCompressReturnsCannotFitWhenOnlyProtectedContentRemains(t *testing.T) {
 	}
 	if !sameMessages(result.Messages, messages) {
 		t.Fatalf("protected messages were changed: %#v", result.Messages)
+	}
+	if len(result.Actions) != 0 || !hasDiagnosticCode(result.Diagnostics, "fallback_no_change") || hasDiagnosticCode(result.Diagnostics, "fallback_applied") {
+		t.Fatalf("unchanged protected content must not report an applied fallback: %#v", result)
+	}
+}
+
+func TestCompressKeepsLatestUserTaggedLogAfterOmittingOldLog(t *testing.T) {
+	messages := []Message{
+		{ID: "s1", Role: RoleSystem, Content: "system"},
+		{ID: "old", Role: RoleUser, Content: strings.Repeat("old log ", 100), Tags: []string{"log"}},
+		{ID: "latest", Role: RoleUser, Content: strings.Repeat("current request ", 50), Tags: []string{"log"}},
+	}
+	result := NewMiddleware(nil, nil).Compress(context.Background(), Request{Messages: messages, ContextLimit: 100})
+	if result.Status != CannotFit || result.AfterTokens <= 100 || result.FailureReason == "" {
+		t.Fatalf("expected explicit over-budget result: %#v", result)
+	}
+	if !reflect.DeepEqual(messageByID(result.Messages, "latest"), messages[2]) {
+		t.Fatalf("latest request changed or removed: %#v", result.Messages)
+	}
+	if messageByID(result.Messages, "old").ID != "" {
+		t.Fatal("old log should have been omitted before returning CannotFit")
+	}
+	for _, action := range result.Actions {
+		if action.UnitID == "latest" {
+			t.Fatalf("latest request must not be a fallback target: %#v", action)
+		}
+	}
+}
+
+func TestCompressLabelsJSONReplacementAsText(t *testing.T) {
+	for _, toolResult := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tool_result=%t", toolResult), func(t *testing.T) {
+			history := Message{ID: "history", Role: RoleAssistant, ContentType: "json", Content: `{"logs":"` + strings.Repeat("entry ", 200) + `"}`}
+			messages := []Message{{ID: "s1", Role: RoleSystem, Content: "system"}}
+			if toolResult {
+				messages = append(messages, Message{ID: "call", Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "c1", Name: "read", Arguments: `{}`}}})
+				history.Role, history.ToolCallID, history.ToolName = RoleTool, "c1", "read"
+			}
+			messages = append(messages, history, Message{ID: "latest", Role: RoleUser, Content: "continue"})
+			before := CloneMessages(messages)
+			result := NewMiddleware(nil, FakeSummarizer{Mode: FakeSummaryError}).Compress(context.Background(), Request{Messages: messages, ContextLimit: 150})
+			got := messageByID(result.Messages, "history")
+			if result.Status != Degraded || got.Content == history.Content || got.ContentType != "text" {
+				t.Fatalf("expected a text replacement that fits: result=%#v history=%#v", result, got)
+			}
+			if !reflect.DeepEqual(messages, before) {
+				t.Fatal("Compress changed caller input")
+			}
+		})
 	}
 }
 
